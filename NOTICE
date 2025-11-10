@@ -1,0 +1,13 @@
+StyleBertVits2 Voice Changer integrates portions of Style-Bert-VITS2.
+
+Included third-party components:
+
+Style-Bert-VITS2 (https://github.com/litagin02/Style-Bert-VITS2)
+Copyright (c) 2023 litagin02
+Licensed under the GNU Affero General Public License v3.0.
+
+Modifications:
+- Extracted inference-related Python packages from the upstream repository into vendor/style_bert_vits2.
+- Removed upstream training scripts, Gradio UI, datasets, notebooks, and auxiliary tooling.
+- Added integration hooks for Whisper-based transcription, emotion fusion, and Discord streaming.
+- Adjusted packaging structure to align with this project's src/ layout.

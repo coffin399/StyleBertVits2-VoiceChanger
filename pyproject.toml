@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stylebertvits2_voice_changer"
+version = "0.1.0"
+description = "Voice conversion pipeline integrating Whisper, emotion analysis, and StyleBertVits2 synthesis with GUI and Discord streaming."
+authors = [{ name = "Cascade AI" }]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "faster-whisper>=0.10.0",
+    "transformers>=4.40.0",
+    "torch",
+    "librosa>=0.10.0",
+    "opensmile>=2.5.0",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12.1",
+    "PySide6>=6.7.0",
+    "pydantic>=2.5",
+]
+
+[project.optional-dependencies]
+development = [
+    "black",
+    "isort",
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
