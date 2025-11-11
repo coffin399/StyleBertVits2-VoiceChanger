@@ -1,211 +1,254 @@
 from __future__ import annotations
 
-import asyncio
+import queue
 import threading
-from collections import deque
-from dataclasses import dataclass
-from typing import Deque, Iterable, Optional, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Optional
 
 import numpy as np
+import torch
+import torchaudio
+from loguru import logger
 
-from app.audio.capture import AudioCapture, AudioCallback, CaptureSettings
-from app.audio.devices import AudioDevice
+from app.audio.capture import AudioCapture, CaptureSettings
 from app.config import AppConfig
-from app.emotion.prosody_analyzer import ProsodyAnalyzer, ProsodyResult
-from app.emotion.text_analyzer import TextEmotionAnalyzer, TextEmotionResult
+from app.output.opus_streamer import OpusSettings, OpusStreamer
 from app.output.system_playback import PlaybackSettings, SystemPlayback
-from app.style.fusion import EmotionFusion
-from app.style.tts_engine import StyleBertSynthesizer, StyleModelPaths
-from app.transcription.whisper_service import TranscriptionResult, WhisperService
+from app.vc.content_encoder import JapaneseHubertContentEncoder
+from app.vc.f0 import F0Extractor
+from app.vc.generator import GeneratorBackend
 
 
 @dataclass(slots=True)
-class PipelineState:
-    """Runtime state exposed to the GUI."""
+class EmotionState:
+    label_scores: dict[str, float] = field(default_factory=dict)
 
+
+@dataclass(slots=True)
+class ProsodyState:
+    features: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class VoicePipelineState:
     last_transcript: str = ""
-    last_emotion: Optional[TextEmotionResult] = None
-    last_prosody: Optional[ProsodyResult] = None
+    last_emotion: Optional[EmotionState] = None
+    last_prosody: Optional[ProsodyState] = None
     last_fusion_metadata: Optional[dict[str, float]] = None
+    last_opus_packets: list[bytes] = field(default_factory=list)
 
 
 class VoiceProcessingPipeline:
-    """Coordinate capture → transcription → emotion fusion → TTS → playback."""
+    """Real-time voice conversion pipeline orchestrating capture → VC → output."""
 
     def __init__(self, config: AppConfig) -> None:
         self._config = config
-        self._state = PipelineState()
 
-        # Audio capture setup
+        self._generator = GeneratorBackend(config.models, config.backend)
+        self._generator_loaded = False
+        self._content_encoder = JapaneseHubertContentEncoder(
+            config.models, config.audio, device=config.backend.device
+        )
+        self._f0_extractor = F0Extractor(
+            sample_rate=config.audio.input_sample_rate,
+            frame_ms=config.streaming.frame_ms,
+        )
+
+        self._capture: Optional[AudioCapture] = None
+        self._playback: Optional[SystemPlayback] = None
+        self._opus_streamer: Optional[OpusStreamer] = None
+        self._resampler: Optional[torchaudio.transforms.Resample] = None
+
+        self._running = threading.Event()
+        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=32)
+        self._worker: Optional[threading.Thread] = None
+
+        self._frame_samples = self._calc_frame_samples()
+        self._segment_samples = self._frame_samples * max(1, self._config.streaming.lookahead_frames)
+        self._hop_samples = max(
+            1,
+            int(self._frame_samples * (1.0 - min(max(self._config.streaming.overlap_ratio, 0.0), 0.95))),
+        )
+        self._buffer = np.zeros(0, dtype=np.float32)
+
+        self._state = VoicePipelineState()
+        self._state_lock = threading.Lock()
+        self._processed_chunks = 0
+        self._dropped_blocks = 0
+        self._target_speaker = 0
+
+    # ------------------------------------------------------------------
+    # Lifecycle management
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        if self._running.is_set():
+            return
+
+        if not self._generator_loaded:
+            logger.info("Loading generator backend…")
+            self._generator.load()
+            self._generator_loaded = True
+            self._prepare_resampler()
+
         capture_settings = CaptureSettings(
-            device_index=config.input_device_index,
-            samplerate=float(config.whisper.sample_rate),
+            device_index=self._config.input_device_index,
+            samplerate=float(self._config.audio.input_sample_rate),
+            blocksize=self._frame_samples,
             channels=1,
             dtype="float32",
         )
         self._capture = AudioCapture(capture_settings)
+        self._capture.register_callback(self._on_audio_block)
 
-        # Transcription and emotion modules
-        self._whisper = WhisperService(config.whisper)
-        self._text_emotion = TextEmotionAnalyzer(config.emotion)
-        self._prosody = ProsodyAnalyzer(
-            config.emotion.opensmile_config,
-            config.emotion.opensmile_feature_level,
-        )
-
-        # StyleBert synthesizer and fusion
-        style_paths = StyleModelPaths(
-            model_file=config.stylebert_model_file,
-            config_file=config.stylebert_config_file,
-            style_vectors=config.stylebert_style_vectors,
-        )
-        self._synthesizer = StyleBertSynthesizer(style_paths, config.style)
-        base_style_vector = self._synthesizer.get_style_vector()
-        self._fusion = EmotionFusion(config.emotion, base_style_vector)
-
-        # Playback routing
         playback_settings = PlaybackSettings(
-            device_index=config.output_device_index,
-            samplerate=config.style.sample_rate,
+            device_index=self._config.output_device_index,
+            samplerate=self._config.audio.output_sample_rate,
             channels=1,
+            blocksize=self._frame_samples,
         )
         self._playback = SystemPlayback(playback_settings)
-
-        # Async processing primitives
-        self._loop = asyncio.new_event_loop()
-        self._loop_thread = threading.Thread(
-            target=self._run_event_loop, name="voice-pipeline-loop", daemon=True
-        )
-        self._audio_queue: asyncio.Queue[Tuple[np.ndarray, float]] = asyncio.Queue()
-        self._running = threading.Event()
-        self._processing_task: Optional[asyncio.Future] = None
-
-    @property
-    def state(self) -> PipelineState:
-        return self._state
-
-    def start(self) -> None:
-        if self._running.is_set():
-            return
-        self._running.set()
-        self._loop_thread.start()
-        self._processing_task = asyncio.run_coroutine_threadsafe(
-            self._processing_loop(), self._loop
-        )
-        self._capture.register_callback(self._on_audio_block)
-        self._capture.start()
         self._playback.start()
+
+        self._opus_streamer = OpusStreamer(
+            OpusSettings(
+                sample_rate=self._config.audio.output_sample_rate,
+                bitrate=self._config.audio.opus_bitrate,
+            )
+        )
+
+        self._running.set()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+        self._capture.start()
+        logger.info("Voice pipeline started (frame={} samples, hop={} samples)", self._frame_samples, self._hop_samples)
 
     def stop(self) -> None:
         if not self._running.is_set():
             return
+
         self._running.clear()
-        self._capture.stop()
-        self._playback.stop()
-        asyncio.run_coroutine_threadsafe(self._audio_queue.put((np.zeros(0), -1.0)), self._loop)
-        if self._processing_task is not None:
+        if self._capture is not None:
+            self._capture.stop()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._worker is not None:
+            self._worker.join(timeout=2.0)
+            self._worker = None
+
+        if self._playback is not None:
+            self._playback.stop()
+            self._playback = None
+
+        if self._opus_streamer is not None:
+            final_packet = self._opus_streamer.flush()
+            if final_packet:
+                with self._state_lock:
+                    self._state.last_opus_packets.append(final_packet)
+
+        self._buffer = np.zeros(0, dtype=np.float32)
+        logger.info("Voice pipeline stopped. Processed chunks={} dropped_blocks={}", self._processed_chunks, self._dropped_blocks)
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+    @property
+    def state(self) -> VoicePipelineState:
+        with self._state_lock:
+            snapshot = replace(self._state)
+            if snapshot.last_fusion_metadata is not None:
+                snapshot.last_fusion_metadata = dict(snapshot.last_fusion_metadata)
+            snapshot.last_opus_packets = list(snapshot.last_opus_packets)
+            return snapshot
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _calc_frame_samples(self) -> int:
+        samples = int(self._config.audio.input_sample_rate * (self._config.streaming.frame_ms / 1000.0))
+        return max(samples, 256)
+
+    def _prepare_resampler(self) -> None:
+        generator_sr = self._generator.sample_rate or self._config.audio.output_sample_rate
+        if generator_sr != self._config.audio.output_sample_rate:
+            self._resampler = torchaudio.transforms.Resample(
+                orig_freq=generator_sr,
+                new_freq=self._config.audio.output_sample_rate,
+            )
+            logger.info("Configured resampler {} Hz → {} Hz", generator_sr, self._config.audio.output_sample_rate)
+        else:
+            self._resampler = None
+
+    def _on_audio_block(self, block: np.ndarray, _frames: int) -> None:
+        mono = block.astype(np.float32, copy=False)
+        if mono.ndim > 1:
+            mono = np.mean(mono, axis=1)
+        try:
+            self._queue.put_nowait(mono)
+        except queue.Full:
+            self._dropped_blocks += 1
+
+    def _worker_loop(self) -> None:
+        while self._running.is_set() or not self._queue.empty():
             try:
-                self._processing_task.result(timeout=5)
-            except Exception:
-                pass
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._loop_thread.join(timeout=2)
-
-    def _run_event_loop(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
-        pending = asyncio.all_tasks(self._loop)
-        for task in pending:
-            task.cancel()
-        self._loop.run_until_complete(self._loop.shutdown_asyncgens())
-        self._loop.close()
-
-    def _on_audio_block(self, block: np.ndarray, frames: int) -> None:
-        if not self._running.is_set():
-            return
-        mono = block[:, 0] if block.ndim > 1 else block
-        mono = mono.astype(np.float32, copy=True)
-        duration = frames / float(self._config.whisper.sample_rate)
-        asyncio.run_coroutine_threadsafe(
-            self._audio_queue.put((mono, duration)), self._loop
-        )
-
-    async def _processing_loop(self) -> None:
-        buffer: Deque[np.ndarray] = deque()
-        buffer_duration = 0.0
-        sample_rate = self._config.whisper.sample_rate
-
-        while self._running.is_set():
-            audio_block, duration = await self._audio_queue.get()
-            if duration < 0:
-                self._audio_queue.task_done()
-                break
-            buffer.append(audio_block)
-            buffer_duration += duration
-            await self._whisper.add_audio_block(audio_block, duration)
-            self._audio_queue.task_done()
-
-            if buffer_duration < self._config.whisper.chunk_seconds:
+                block = self._queue.get(timeout=0.1)
+            except queue.Empty:
                 continue
 
-            prosody_samples = (
-                np.concatenate(list(buffer)) if buffer else np.zeros(0, dtype=np.float32)
-            )
-            async for transcript in self._whisper.transcribe():
-                if not transcript.text:
-                    continue
-                await self._handle_transcript(transcript, prosody_samples, sample_rate)
+            if block is None:
+                self._queue.task_done()
+                break
 
-            buffer.clear()
-            buffer_duration = 0.0
+            self._buffer = np.concatenate((self._buffer, block))
+            while self._buffer.size >= self._segment_samples:
+                chunk = self._buffer[: self._segment_samples].copy()
+                self._buffer = self._buffer[self._hop_samples :]
+                try:
+                    self._process_chunk(chunk)
+                except Exception as exc:  # pragma: no cover - runtime safeguard
+                    logger.exception("Error during VC chunk processing: {}", exc)
+                finally:
+                    self._processed_chunks += 1
+            self._queue.task_done()
 
-    async def _handle_transcript(
-        self,
-        transcript: TranscriptionResult,
-        prosody_samples: np.ndarray,
-        sample_rate: int,
-    ) -> None:
-        text_emotion = self._text_emotion.analyze(transcript.text)
-        prosody_result = self._prosody.analyze(prosody_samples, sample_rate)
-        fusion_result = self._fusion.fuse(text_emotion, prosody_result)
+    def _process_chunk(self, chunk: np.ndarray) -> None:
+        if not self._generator_loaded or chunk.size == 0:
+            return
 
-        sr, audio = self._synthesizer.synthesize(
-            text=transcript.text,
-            style_vector=fusion_result.style_vector,
-        )
-        float_audio = audio.astype(np.float32) / 32768.0
-        self._playback.enqueue([float_audio])
+        audio_tensor = torch.from_numpy(chunk).unsqueeze(0)
+        content_features = self._content_encoder.encode(
+            audio_tensor,
+            sample_rate=self._config.audio.input_sample_rate,
+        ).detach()
 
-        self._state.last_transcript = transcript.text
-        self._state.last_emotion = text_emotion
-        self._state.last_prosody = prosody_result
-        self._state.last_fusion_metadata = fusion_result.metadata
+        f0 = self._f0_extractor.extract(chunk)
 
+        waveform = self._generator.infer(content_features, f0, speaker_id=self._target_speaker)
+        if waveform.size == 0:
+            return
 
-def get_default_devices() -> Tuple[Optional[AudioDevice], Optional[AudioDevice]]:
-    """Convenience helper to fetch default input/output devices."""
+        output_wave = waveform
+        if self._resampler is not None:
+            resampled = self._resampler(torch.from_numpy(waveform).unsqueeze(0))
+            output_wave = resampled.squeeze(0).cpu().numpy()
+        output_wave = np.clip(output_wave, -1.0, 1.0)
 
-    import sounddevice as sd  # Local import to avoid mandatory dependency at import time
+        if self._playback is not None:
+            self._playback.enqueue([np.expand_dims(output_wave, axis=1)])
 
-    default_input = sd.default.device[0]
-    default_output = sd.default.device[1]
-    input_device = None
-    output_device = None
-    for idx, info in enumerate(sd.query_devices()):
-        if idx == default_input:
-            input_device = AudioDevice(
-                name=info["name"],
-                index=idx,
-                max_input_channels=info["max_input_channels"],
-                max_output_channels=info["max_output_channels"],
-                default_samplerate=info["default_samplerate"],
-            )
-        if idx == default_output:
-            output_device = AudioDevice(
-                name=info["name"],
-                index=idx,
-                max_input_channels=info["max_input_channels"],
-                max_output_channels=info["max_output_channels"],
-                default_samplerate=info["default_samplerate"],
-            )
-    return input_device, output_device
+        if self._opus_streamer is not None:
+            packets = self._opus_streamer.encode(output_wave)
+        else:
+            packets = []
+
+        metadata = {
+            "chunks": float(self._processed_chunks + 1),
+            "queue_depth": float(self._queue.qsize()),
+            "dropped_blocks": float(self._dropped_blocks),
+        }
+        with self._state_lock:
+            self._state.last_opus_packets = list(packets)
+            self._state.last_fusion_metadata = metadata
+
+*** End of File
